@@ -1,0 +1,47 @@
+name: Publish Kindle dashboard
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 * * * *"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: kindle-dashboard-pages
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Install Chinese fonts and image library
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fonts-noto-cjk
+          python -m pip install --disable-pip-version-check Pillow
+
+      - name: Render current dashboard
+        working-directory: kindle_anniversary_dashboard
+        run: python render_dashboard.py
+
+      - name: Upload the PNG as the Pages site
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: kindle_anniversary_dashboard/out
+
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
