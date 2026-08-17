@@ -27,6 +27,7 @@ from PIL import Image, ImageDraw, ImageFont
 WIDTH, HEIGHT = 1072, 1448
 ROOT = Path(__file__).resolve().parent
 OUT = ROOT / "out" / "anniversary-dashboard.png"
+DISPLAY_FONT = ROOT / "assets" / "fonts" / "UnifrakturCook-Bold.ttf"
 
 # A restrained grayscale palette: enough tonal separation for card hierarchy,
 # without faint shadows or gradients that turn muddy on an e-ink panel.
@@ -84,6 +85,12 @@ MARKET_GROUPS: dict[str, tuple[QuoteSpec, ...]] = {
         QuoteSpec("usINX", "^GSPC", "标普 500"),
         QuoteSpec("usIXIC", "^IXIC", "纳斯达克"),
     ),
+    # International commodity futures use the latest available settlement when
+    # their market is closed, so they remain useful over the weekend too.
+    "futures": (
+        QuoteSpec("hf_GC", "GC=F", "黄金"),
+        QuoteSpec("hf_CL", "CL=F", "WTI 原油"),
+    ),
 }
 
 
@@ -93,6 +100,20 @@ def font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
         if Path(candidate).exists():
             return ImageFont.truetype(candidate, size)
     return ImageFont.load_default()
+
+
+def display_font(size: int) -> ImageFont.FreeTypeFont:
+    """Load the bundled Fraktur face for the two Latin display lines only."""
+    # Bundling the font keeps Windows and GitHub's Ubuntu renderer identical.
+    # The Windows face is only a local fallback for an incomplete checkout;
+    # body text always stays in the Chinese-capable system font.
+    for candidate in (DISPLAY_FONT, Path("C:/Windows/Fonts/swgothe.ttf")):
+        try:
+            if candidate.is_file():
+                return ImageFont.truetype(str(candidate), size)
+        except OSError:
+            continue
+    return font(size, True)
 
 
 def fetch_bytes(url: str, extra_headers: dict[str, str] | None = None) -> bytes:
@@ -161,6 +182,14 @@ def make_quote(spec: QuoteSpec, price: object, previous_close: object) -> Market
     return MarketQuote(spec.label, current, (current - previous) / previous * 100)
 
 
+def make_percent_quote(spec: QuoteSpec, price: object, change_percent: object) -> MarketQuote | None:
+    """Build a quote when a provider already returns percentage change."""
+    current, change = number(price), number(change_percent)
+    if current is None or change is None:
+        return None
+    return MarketQuote(spec.label, current, change)
+
+
 def fetch_tencent_quotes(specs: tuple[QuoteSpec, ...]) -> dict[str, MarketQuote]:
     """Fetch A/HK/US index quotes in one request from Tencent Finance."""
     if not specs:
@@ -174,11 +203,18 @@ def fetch_tencent_quotes(specs: tuple[QuoteSpec, ...]) -> dict[str, MarketQuote]
     quotes: dict[str, MarketQuote] = {}
     for code, payload in re.findall(r'v_([^=]+)="([^"]*)";', raw):
         spec = by_code.get(code)
-        fields = payload.split("~")
-        if spec and len(fields) > 4:
-            quote = make_quote(spec, fields[3], fields[4])
-            if quote:
-                quotes[code] = quote
+        if not spec:
+            continue
+        if code.startswith("hf_"):
+            # Commodity futures use a comma-delimited payload: 0 = price,
+            # 1 = already-calculated percentage change.
+            fields = payload.split(",")
+            quote = make_percent_quote(spec, fields[0], fields[1]) if len(fields) > 1 else None
+        else:
+            fields = payload.split("~")
+            quote = make_quote(spec, fields[3], fields[4]) if len(fields) > 4 else None
+        if quote:
+            quotes[code] = quote
     return quotes
 
 
@@ -240,16 +276,19 @@ def fetch_eastmoney_a_quotes(specs: tuple[QuoteSpec, ...]) -> dict[str, MarketQu
 
 
 def market_snapshot(now: dt.datetime) -> dict[str, tuple[MarketQuote | None, ...]]:
-    """Return structured A/HK/US data; mainland rows intentionally rest on weekends."""
+    """Return A/HK/US/futures data; mainland rows intentionally rest on weekends."""
     weekend = now.weekday() >= 5
-    groups = ("hk", "us") if weekend else ("a", "hk", "us")
+    groups = ("hk", "us", "futures") if weekend else ("a", "hk", "us", "futures")
     specs = tuple(spec for group in groups for spec in MARKET_GROUPS[group])
     try:
         quotes = fetch_tencent_quotes(specs)
     except Exception:
         quotes = {}
 
-    missing = tuple(spec for spec in specs if spec.code not in quotes)
+    # Yahoo's commodity symbols can point at a different contract month.  Use
+    # the fallback only for index quotes so an outage cannot create a misleading
+    # futures price jump by silently mixing contracts.
+    missing = tuple(spec for spec in specs if spec.code not in quotes and not spec.code.startswith("hf_"))
     if missing:
         quotes.update(fetch_yahoo_quotes(missing))
 
@@ -286,14 +325,16 @@ def draw_eyebrow(draw: ImageDraw.ImageDraw, x: int, y: int, value: str) -> None:
     draw.text((x, y), value, font=font(22, True), fill=SECONDARY)
 
 
-def draw_pill(draw: ImageDraw.ImageDraw, x: int, y: int, value: str) -> None:
-    pill_font = font(26, True)
-    # Some Windows TTC fonts report a degenerate textbbox; a fixed e-ink-safe
-    # height is more reliable than deriving the pill geometry from that bbox.
-    width = math.ceil(draw.textlength(value, font=pill_font)) + 30
-    height = 48
-    draw.rounded_rectangle((x, y, x + width, y + height), radius=height // 2, fill=INK)
-    draw.text((x + 15, y + 7), value, font=pill_font, fill=PAPER)
+def draw_weekday_reminder(draw: ImageDraw.ImageDraw, x: int, y: int, weekday: int) -> None:
+    """A quiet inline weekday/reminder line, without the former black badge."""
+    weekday_font = font(29, True)
+    reminder_font = font(23)
+    weekday_text = "星期" + "一二三四五六日"[weekday]
+    reminder = "请多喝水、按时吃饭、注意保暖、不要久坐：）"
+    draw.text((x, y), weekday_text, font=weekday_font, fill=INK)
+    cursor = x + math.ceil(draw.textlength(weekday_text, font=weekday_font)) + 16
+    draw.text((cursor, y + 4), "·", font=font(21, True), fill=BORDER)
+    draw.text((cursor + 23, y + 5), reminder, font=reminder_font, fill=SECONDARY)
 
 
 def draw_shuttlecock(draw: ImageDraw.ImageDraw, x: int, y: int) -> None:
@@ -304,16 +345,14 @@ def draw_shuttlecock(draw: ImageDraw.ImageDraw, x: int, y: int) -> None:
     draw.polygon(((x + 27, y + 27), (x + 40, y + 4), (x + 32, y + 31)), outline=INK)
 
 
-def format_quote(quote: MarketQuote | None) -> str:
-    if quote is None:
-        return "行情暂不可达"
+def quote_change_text(quote: MarketQuote) -> str:
     if quote.change_percent > 0.005:
         arrow, prefix = "↑", "+"
     elif quote.change_percent < -0.005:
         arrow, prefix = "↓", ""
     else:
         arrow, prefix = "—", ""
-    return f"{quote.label}  {quote.price:,.2f}  {arrow}{prefix}{quote.change_percent:.2f}%"
+    return f"{arrow}{prefix}{quote.change_percent:.2f}%"
 
 
 def draw_market_group(
@@ -322,21 +361,35 @@ def draw_market_group(
     y: int,
     width: int,
     label: str,
+    group_key: str,
     quotes: tuple[MarketQuote | None, ...],
     *,
     divider: bool,
 ) -> None:
-    """Draw a stable two-line index row instead of one fragile long paragraph."""
-    draw.text((x, y + 23), label, font=font(31, True), fill=INK)
-    data_x = x + 156
-    quote_font = font(28)
-    if not any(quotes):
-        draw.text((data_x, y + 27), "暂未取得最新行情 · 下次更新自动重试", font=font(26), fill=SECONDARY)
-    else:
-        for index, quote in enumerate(quotes):
-            draw.text((data_x, y + 6 + index * 39), format_quote(quote), font=quote_font, fill=SECONDARY)
+    """Draw two compact metric tiles in one iOS-style market row."""
+    draw.text((x, y + 24), label, font=font(29, True), fill=INK)
+    specs = MARKET_GROUPS[group_key]
+    data_x = x + 122
+    data_width = width - 122
+    slot_width = data_width / max(1, len(specs))
+    for index, (spec, quote) in enumerate(zip(specs, quotes)):
+        quote_x = round(data_x + index * slot_width)
+        if index:
+            draw.line((quote_x - 14, y + 12, quote_x - 14, y + 63), fill=DIVIDER, width=1)
+        visible_label = quote.label if quote else spec.label
+        if quote:
+            price_text = f"{visible_label} {quote.price:,.2f}"
+            change_text = quote_change_text(quote)
+        else:
+            price_text = f"{visible_label} 暂不可达"
+            change_text = "下次更新重试"
+        price_font = font(22, True)
+        if draw.textlength(price_text, font=price_font) > slot_width - 22:
+            price_font = font(20, True)
+        draw.text((quote_x, y + 10), price_text, font=price_font, fill=SECONDARY)
+        draw.text((quote_x, y + 41), change_text, font=font(21, True), fill=INK if quote else SECONDARY)
     if divider:
-        draw.line((x, y + 86, x + width, y + 86), fill=DIVIDER, width=1)
+        draw.line((x, y + 76, x + width, y + 76), fill=DIVIDER, width=1)
 
 
 def draw_chick(draw: ImageDraw.ImageDraw, x: int, y: int, state: str) -> None:
@@ -564,19 +617,19 @@ def render() -> Path:
         markets = market_snapshot(now)
     except Exception:
         # Rendering a graceful screen is more important than one provider's outage.
-        markets = {"hk": (None, None), "us": (None, None)}
+        markets = {"hk": (None, None), "us": (None, None), "futures": (None, None)}
         if not weekend:
             markets["a"] = (None, None)
 
     image = Image.new("L", (WIDTH, HEIGHT), PAPER)
     draw = ImageDraw.Draw(image)
-    title, date_font, body = font(42, True), font(88, True), font(34)
+    title, date_font, body = display_font(54), display_font(88), font(34)
 
     # Header: generous whitespace, one large date, and the cake as the quiet
     # anniversary cue rather than another information card.
-    draw.text((MARGIN, 62), "ParaDog's Day", font=title, fill=INK)
-    draw.text((MARGIN, 142), now.strftime("%Y · %m · %d"), font=date_font, fill=INK)
-    draw_pill(draw, MARGIN, 286, "星期" + "一二三四五六日"[now.weekday()])
+    draw.text((MARGIN, 40), "ParaDog's Day", font=title, fill=INK)
+    draw.text((MARGIN, 116), now.strftime("%Y.%m.%d"), font=date_font, fill=INK)
+    draw_weekday_reminder(draw, MARGIN, 286, now.weekday())
     draw_cake(image, draw, 770, 82, str(days))
     draw.line((MARGIN, 360, WIDTH - MARGIN, 360), fill=DIVIDER, width=2)
 
@@ -590,10 +643,10 @@ def render() -> Path:
         draw.text((MARGIN + 28, weather_top + 58 + index * 39), line, font=weather_font, fill=INK)
 
     # A grouped market card replaces the former newspaper-like text block.
-    market_top, market_bottom = 548, 912
+    market_top, market_bottom = 548, 976
     draw_card(draw, (MARGIN, market_top, WIDTH - MARGIN, market_bottom))
     draw.text((MARGIN + 28, market_top + 20), "市场速览", font=font(39, True), fill=INK)
-    hint = "行情可能延迟"
+    hint = "行情可能延迟 · 最近交易日"
     hint_font = font(23)
     hint_width = draw.textlength(hint, font=hint_font)
     draw.text((WIDTH - MARGIN - 28 - hint_width, market_top + 33), hint, font=hint_font, fill=SECONDARY)
@@ -609,16 +662,18 @@ def render() -> Path:
             font=font(25, True),
             fill=INK,
         )
-        draw_market_group(draw, row_x, market_top + 150, row_width, "港股", markets["hk"], divider=True)
-        draw_market_group(draw, row_x, market_top + 241, row_width, "美股", markets["us"], divider=False)
+        draw_market_group(draw, row_x, market_top + 154, row_width, "港股", "hk", markets["hk"], divider=True)
+        draw_market_group(draw, row_x, market_top + 232, row_width, "美股", "us", markets["us"], divider=True)
+        draw_market_group(draw, row_x, market_top + 310, row_width, "期货", "futures", markets["futures"], divider=False)
     else:
-        draw_market_group(draw, row_x, market_top + 76, row_width, "A 股", markets["a"], divider=True)
-        draw_market_group(draw, row_x, market_top + 167, row_width, "港股", markets["hk"], divider=True)
-        draw_market_group(draw, row_x, market_top + 258, row_width, "美股", markets["us"], divider=False)
+        draw_market_group(draw, row_x, market_top + 76, row_width, "A 股", "a", markets["a"], divider=True)
+        draw_market_group(draw, row_x, market_top + 154, row_width, "港股", "hk", markets["hk"], divider=True)
+        draw_market_group(draw, row_x, market_top + 232, row_width, "美股", "us", markets["us"], divider=True)
+        draw_market_group(draw, row_x, market_top + 310, row_width, "期货", "futures", markets["futures"], divider=False)
 
     # The joke has its own quiet card, preserving a little breathing room.
-    joke_top = 944
-    draw_card(draw, (MARGIN, joke_top, WIDTH - MARGIN, joke_top + 160), fill=CARD_LIGHT)
+    joke_top = 1008
+    draw_card(draw, (MARGIN, joke_top, WIDTH - MARGIN, joke_top + 150), fill=CARD_LIGHT)
     draw_eyebrow(draw, MARGIN + 28, joke_top + 20, "TODAY'S LITTLE NOTE")
     y = joke_top + 58
     joke = JOKES[now.date().toordinal() % len(JOKES)]
@@ -628,9 +683,9 @@ def render() -> Path:
 
     # The hand-drawn pet remains tactile and personal, with a clean divider
     # separating illustration from its current little life update.
-    pet_top = 1162
-    draw_card(draw, (MARGIN, pet_top, WIDTH - MARGIN, 1370), fill=CARD_LIGHT)
-    draw.line((298, pet_top + 22, 298, 1348), fill=DIVIDER, width=2)
+    pet_top = 1190
+    draw_card(draw, (MARGIN, pet_top, WIDTH - MARGIN, 1398), fill=CARD_LIGHT)
+    draw.line((298, pet_top + 22, 298, 1376), fill=DIVIDER, width=2)
     draw_pet(image, draw, 83, pet_top + 30, pet)
     draw_eyebrow(draw, 328, pet_top + 25, "A LITTLE CHECK-IN")
     draw.text((328, pet_top + 67), f"电子小鸡 · {pet}", font=font(40, True), fill=INK)
