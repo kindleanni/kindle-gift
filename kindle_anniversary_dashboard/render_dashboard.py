@@ -10,9 +10,16 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import math
+import re
 import shutil
+import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote as urlquote
 from zoneinfo import ZoneInfo
 
 from PIL import Image, ImageDraw, ImageFont
@@ -20,6 +27,12 @@ from PIL import Image, ImageDraw, ImageFont
 WIDTH, HEIGHT = 1072, 1448
 ROOT = Path(__file__).resolve().parent
 OUT = ROOT / "out" / "anniversary-dashboard.png"
+
+# A restrained grayscale palette: enough tonal separation for card hierarchy,
+# without faint shadows or gradients that turn muddy on an e-ink panel.
+PAPER, CARD, CARD_LIGHT = 248, 242, 252
+INK, SECONDARY, BORDER, DIVIDER = 18, 75, 165, 190
+MARGIN, RADIUS = 72, 26
 
 PET_STATES = ["学习中", "运动中", "打游戏中", "睡觉中", "做饭中", "逛街中", "洗澡中", "游泳中"]
 PET_ART_FILES = {
@@ -39,6 +52,41 @@ FONT_CANDIDATES = [
 ]
 
 
+@dataclass(frozen=True)
+class QuoteSpec:
+    """One compact index shown on the dashboard."""
+
+    code: str
+    yahoo_symbol: str
+    label: str
+
+
+@dataclass(frozen=True)
+class MarketQuote:
+    label: str
+    price: float
+    change_percent: float
+
+
+# Tencent's batch endpoint keeps the hourly update to one request.  Yahoo's
+# chart endpoint and Eastmoney's existing A-share endpoint below are fallbacks,
+# so a transient provider failure only affects the corresponding row.
+MARKET_GROUPS: dict[str, tuple[QuoteSpec, ...]] = {
+    "a": (
+        QuoteSpec("sh000001", "000001.SS", "上证"),
+        QuoteSpec("sz399001", "399001.SZ", "深成"),
+    ),
+    "hk": (
+        QuoteSpec("hkHSI", "^HSI", "恒生"),
+        QuoteSpec("hkHSTECH", "^HSTECH", "恒生科技"),
+    ),
+    "us": (
+        QuoteSpec("usINX", "^GSPC", "标普 500"),
+        QuoteSpec("usIXIC", "^IXIC", "纳斯达克"),
+    ),
+}
+
+
 def font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
     candidates = (["C:/Windows/Fonts/msyhbd.ttc", "C:/Windows/Fonts/Dengb.ttf"] if bold else []) + FONT_CANDIDATES
     for candidate in candidates:
@@ -47,15 +95,37 @@ def font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
     return ImageFont.load_default()
 
 
-def fetch_json(url: str) -> dict:
-    """Fetch JSON using headers accepted by both public data providers."""
-    request = urllib.request.Request(url, headers={
+def fetch_bytes(url: str, extra_headers: dict[str, str] | None = None) -> bytes:
+    """Fetch a small public response with one short retry for flaky endpoints."""
+    headers = {
         "User-Agent": "Mozilla/5.0 (Kindle anniversary dashboard; +https://github.com/)",
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6",
-    })
-    with urllib.request.urlopen(request, timeout=12) as response:
-        return json.load(response)
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+
+    last_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            request = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(request, timeout=12) as response:
+                return response.read()
+        except (HTTPError, URLError, OSError, TimeoutError) as error:
+            last_error = error
+            if attempt == 0:
+                time.sleep(0.4)
+    assert last_error is not None
+    raise last_error
+
+
+def fetch_json(url: str) -> dict:
+    """Fetch a JSON document from a public data provider."""
+    return json.loads(fetch_bytes(url).decode("utf-8"))
+
+
+def fetch_text(url: str, *, encoding: str = "utf-8", extra_headers: dict[str, str] | None = None) -> str:
+    return fetch_bytes(url, extra_headers).decode(encoding, errors="replace")
 
 
 def weather() -> str:
@@ -75,26 +145,123 @@ def weather() -> str:
             return "天气服务暂不可达"
 
 
-def market_news() -> str:
-    """A compact real-time A-share briefing from Eastmoney's index quote API."""
-    url = "https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&invt=2&fields=f12,f14,f2,f3,f4,f6&secids=1.000001,0.399001,0.399006"
+def number(value: object) -> float | None:
+    """Turn a provider value into a safe finite number."""
+    try:
+        result = float(str(value).replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def make_quote(spec: QuoteSpec, price: object, previous_close: object) -> MarketQuote | None:
+    current, previous = number(price), number(previous_close)
+    if current is None or previous in (None, 0):
+        return None
+    return MarketQuote(spec.label, current, (current - previous) / previous * 100)
+
+
+def fetch_tencent_quotes(specs: tuple[QuoteSpec, ...]) -> dict[str, MarketQuote]:
+    """Fetch A/HK/US index quotes in one request from Tencent Finance."""
+    if not specs:
+        return {}
+    by_code = {spec.code: spec for spec in specs}
+    raw = fetch_text(
+        "https://qt.gtimg.cn/q=" + ",".join(by_code),
+        encoding="gb18030",
+        extra_headers={"Referer": "https://gu.qq.com/"},
+    )
+    quotes: dict[str, MarketQuote] = {}
+    for code, payload in re.findall(r'v_([^=]+)="([^"]*)";', raw):
+        spec = by_code.get(code)
+        fields = payload.split("~")
+        if spec and len(fields) > 4:
+            quote = make_quote(spec, fields[3], fields[4])
+            if quote:
+                quotes[code] = quote
+    return quotes
+
+
+def fetch_yahoo_quote(spec: QuoteSpec) -> MarketQuote | None:
+    """Independent no-key fallback; only used for a quote Tencent did not return."""
+    symbol = urlquote(spec.yahoo_symbol, safe="")
+    data = fetch_json(f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=5d&interval=1d")
+    result = data.get("chart", {}).get("result", [])
+    if not result:
+        return None
+    chart = result[0]
+    meta = chart.get("meta", {})
+    close_values = [number(value) for value in chart.get("indicators", {}).get("quote", [{}])[0].get("close", [])]
+    close_values = [value for value in close_values if value is not None]
+    price = number(meta.get("regularMarketPrice")) or (close_values[-1] if close_values else None)
+    previous = number(meta.get("chartPreviousClose")) or number(meta.get("previousClose"))
+    if previous is None and len(close_values) >= 2:
+        previous = close_values[-2]
+    return make_quote(spec, price, previous)
+
+
+def fetch_yahoo_quotes(specs: tuple[QuoteSpec, ...]) -> dict[str, MarketQuote]:
+    """Limit fallback concurrency to avoid slowing an hourly render too much."""
+    if not specs:
+        return {}
+    quotes: dict[str, MarketQuote] = {}
+    with ThreadPoolExecutor(max_workers=min(3, len(specs))) as pool:
+        futures = {pool.submit(fetch_yahoo_quote, spec): spec for spec in specs}
+        for future in as_completed(futures):
+            try:
+                quote = future.result()
+            except Exception:
+                continue
+            if quote:
+                quotes[futures[future].code] = quote
+    return quotes
+
+
+def fetch_eastmoney_a_quotes(specs: tuple[QuoteSpec, ...]) -> dict[str, MarketQuote]:
+    """Keep the former provider as a final A-share-only fallback."""
+    if not specs:
+        return {}
+    by_symbol = {spec.code[2:]: spec for spec in specs}
+    url = "https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&invt=2&fields=f12,f2,f3&secids=1.000001,0.399001,0.399006"
     try:
         data = fetch_json(url)
-        quotes = data.get("data", {}).get("diff", [])
-        if isinstance(quotes, dict):
-            quotes = list(quotes.values())
-        parts = []
-        for quote in quotes:
-            name = quote.get("f14") or quote.get("f12")
-            price, change = quote.get("f2"), quote.get("f3")
-            if name and price is not None and change is not None:
-                prefix = "+" if float(change) > 0 else ""
-                parts.append(f"{name} {float(price):,.2f} {prefix}{float(change):.2f}%")
-        if parts:
-            return " · ".join(parts)
+        rows = data.get("data", {}).get("diff", [])
+        if isinstance(rows, dict):
+            rows = list(rows.values())
+        quotes: dict[str, MarketQuote] = {}
+        for row in rows:
+            spec = by_symbol.get(str(row.get("f12", "")))
+            price, change = number(row.get("f2")), number(row.get("f3"))
+            if spec and price is not None and change is not None:
+                quotes[spec.code] = MarketQuote(spec.label, price, change)
+        return quotes
     except Exception:
-        pass
-    return "行情服务暂不可达（下次更新将自动重试）"
+        return {}
+
+
+def market_snapshot(now: dt.datetime) -> dict[str, tuple[MarketQuote | None, ...]]:
+    """Return structured A/HK/US data; mainland rows intentionally rest on weekends."""
+    weekend = now.weekday() >= 5
+    groups = ("hk", "us") if weekend else ("a", "hk", "us")
+    specs = tuple(spec for group in groups for spec in MARKET_GROUPS[group])
+    try:
+        quotes = fetch_tencent_quotes(specs)
+    except Exception:
+        quotes = {}
+
+    missing = tuple(spec for spec in specs if spec.code not in quotes)
+    if missing:
+        quotes.update(fetch_yahoo_quotes(missing))
+
+    if not weekend:
+        missing_a = tuple(spec for spec in MARKET_GROUPS["a"] if spec.code not in quotes)
+        if missing_a:
+            quotes.update(fetch_eastmoney_a_quotes(missing_a))
+
+    return {
+        group: tuple(quotes.get(spec.code) for spec in MARKET_GROUPS[group])
+        for group in groups
+    }
 
 
 def wrap(draw: ImageDraw.ImageDraw, value: str, fnt, max_width: int) -> list[str]:
@@ -111,8 +278,65 @@ def wrap(draw: ImageDraw.ImageDraw, value: str, fnt, max_width: int) -> list[str
     return lines
 
 
-def draw_rule(draw, y: int) -> None:
-    draw.line((72, y, WIDTH - 72, y), fill=70, width=2)
+def draw_card(draw: ImageDraw.ImageDraw, box: tuple[int, int, int, int], *, fill: int = CARD) -> None:
+    draw.rounded_rectangle(box, radius=RADIUS, fill=fill, outline=BORDER, width=2)
+
+
+def draw_eyebrow(draw: ImageDraw.ImageDraw, x: int, y: int, value: str) -> None:
+    draw.text((x, y), value, font=font(22, True), fill=SECONDARY)
+
+
+def draw_pill(draw: ImageDraw.ImageDraw, x: int, y: int, value: str) -> None:
+    pill_font = font(26, True)
+    # Some Windows TTC fonts report a degenerate textbbox; a fixed e-ink-safe
+    # height is more reliable than deriving the pill geometry from that bbox.
+    width = math.ceil(draw.textlength(value, font=pill_font)) + 30
+    height = 48
+    draw.rounded_rectangle((x, y, x + width, y + height), radius=height // 2, fill=INK)
+    draw.text((x + 15, y + 7), value, font=pill_font, fill=PAPER)
+
+
+def draw_shuttlecock(draw: ImageDraw.ImageDraw, x: int, y: int) -> None:
+    """A tiny badminton cue for the weekend note, legible in one color."""
+    draw.ellipse((x + 10, y + 25, x + 30, y + 41), fill=PAPER, outline=INK, width=2)
+    draw.polygon(((x + 13, y + 27), (x + 3, y + 1), (x + 19, y + 25)), outline=INK)
+    draw.polygon(((x + 20, y + 25), (x + 21, y), (x + 31, y + 26)), outline=INK)
+    draw.polygon(((x + 27, y + 27), (x + 40, y + 4), (x + 32, y + 31)), outline=INK)
+
+
+def format_quote(quote: MarketQuote | None) -> str:
+    if quote is None:
+        return "行情暂不可达"
+    if quote.change_percent > 0.005:
+        arrow, prefix = "↑", "+"
+    elif quote.change_percent < -0.005:
+        arrow, prefix = "↓", ""
+    else:
+        arrow, prefix = "—", ""
+    return f"{quote.label}  {quote.price:,.2f}  {arrow}{prefix}{quote.change_percent:.2f}%"
+
+
+def draw_market_group(
+    draw: ImageDraw.ImageDraw,
+    x: int,
+    y: int,
+    width: int,
+    label: str,
+    quotes: tuple[MarketQuote | None, ...],
+    *,
+    divider: bool,
+) -> None:
+    """Draw a stable two-line index row instead of one fragile long paragraph."""
+    draw.text((x, y + 23), label, font=font(31, True), fill=INK)
+    data_x = x + 156
+    quote_font = font(28)
+    if not any(quotes):
+        draw.text((data_x, y + 27), "暂未取得最新行情 · 下次更新自动重试", font=font(26), fill=SECONDARY)
+    else:
+        for index, quote in enumerate(quotes):
+            draw.text((data_x, y + 6 + index * 39), format_quote(quote), font=quote_font, fill=SECONDARY)
+    if divider:
+        draw.line((x, y + 86, x + width, y + 86), fill=DIVIDER, width=1)
 
 
 def draw_chick(draw: ImageDraw.ImageDraw, x: int, y: int, state: str) -> None:
@@ -335,37 +559,82 @@ def render() -> Path:
     days = (now.date() - together_since).days
     # A given hour always has the same pet state, avoiding changes on each run.
     pet = PET_STATES[(now.date().toordinal() * 24 + now.hour) % len(PET_STATES)]
-    image = Image.new("L", (WIDTH, HEIGHT), 248)
+    weekend = now.weekday() >= 5
+    try:
+        markets = market_snapshot(now)
+    except Exception:
+        # Rendering a graceful screen is more important than one provider's outage.
+        markets = {"hk": (None, None), "us": (None, None)}
+        if not weekend:
+            markets["a"] = (None, None)
+
+    image = Image.new("L", (WIDTH, HEIGHT), PAPER)
     draw = ImageDraw.Draw(image)
-    title, date_font, body, small = font(42, True), font(98, True), font(35), font(28)
+    title, date_font, body = font(42, True), font(88, True), font(34)
 
-    draw.text((72, 66), "ParaDog's Day", font=title, fill=25)
-    draw.text((72, 150), now.strftime("%Y.%m.%d"), font=date_font, fill=0)
-    draw.text((76, 294), "星期" + "一二三四五六日"[now.weekday()], font=body, fill=45)
-    draw_cake(image, draw, 790, 82, str(days))
-    draw_rule(draw, 362)
+    # Header: generous whitespace, one large date, and the cake as the quiet
+    # anniversary cue rather than another information card.
+    draw.text((MARGIN, 62), "ParaDog's Day", font=title, fill=INK)
+    draw.text((MARGIN, 142), now.strftime("%Y · %m · %d"), font=date_font, fill=INK)
+    draw_pill(draw, MARGIN, 286, "星期" + "一二三四五六日"[now.weekday()])
+    draw_cake(image, draw, 770, 82, str(days))
+    draw.line((MARGIN, 360, WIDTH - MARGIN, 360), fill=DIVIDER, width=2)
 
-    draw.text((72, 418), "北京天气  ·  " + weather(), font=body, fill=20)
-    draw_rule(draw, 495)
+    # Weather is a concise, standalone information card.
+    weather_top = 386
+    draw_card(draw, (MARGIN, weather_top, WIDTH - MARGIN, weather_top + 132))
+    draw_eyebrow(draw, MARGIN + 28, weather_top + 20, "BEIJING · WEATHER")
+    weather_text = weather()
+    weather_font = font(36)
+    for index, line in enumerate(wrap(draw, weather_text, weather_font, WIDTH - MARGIN * 2 - 56)[:2]):
+        draw.text((MARGIN + 28, weather_top + 58 + index * 39), line, font=weather_font, fill=INK)
 
-    draw.text((72, 540), "今日 A 股", font=title, fill=20)
-    y = 602
-    for line in wrap(draw, market_news(), body, WIDTH - 144)[:3]:
-        draw.text((72, y), line, font=body, fill=45)
-        y += 49
-    draw_rule(draw, 778)
+    # A grouped market card replaces the former newspaper-like text block.
+    market_top, market_bottom = 548, 912
+    draw_card(draw, (MARGIN, market_top, WIDTH - MARGIN, market_bottom))
+    draw.text((MARGIN + 28, market_top + 20), "市场速览", font=font(39, True), fill=INK)
+    hint = "行情可能延迟"
+    hint_font = font(23)
+    hint_width = draw.textlength(hint, font=hint_font)
+    draw.text((WIDTH - MARGIN - 28 - hint_width, market_top + 33), hint, font=hint_font, fill=SECONDARY)
 
-    draw.text((72, 821), "今日笑话", font=title, fill=20)
-    y = 882
+    row_x, row_width = MARGIN + 28, WIDTH - MARGIN * 2 - 56
+    if weekend:
+        banner_top = market_top + 75
+        draw.rounded_rectangle((row_x, banner_top, row_x + row_width, banner_top + 58), radius=18, fill=232, outline=BORDER, width=1)
+        draw_shuttlecock(draw, row_x + 10, banner_top + 8)
+        draw.text(
+            (row_x + 59, banner_top + 15),
+            "这一周的交易辛苦啦！现在是羽毛球时间枭枭枭",
+            font=font(25, True),
+            fill=INK,
+        )
+        draw_market_group(draw, row_x, market_top + 150, row_width, "港股", markets["hk"], divider=True)
+        draw_market_group(draw, row_x, market_top + 241, row_width, "美股", markets["us"], divider=False)
+    else:
+        draw_market_group(draw, row_x, market_top + 76, row_width, "A 股", markets["a"], divider=True)
+        draw_market_group(draw, row_x, market_top + 167, row_width, "港股", markets["hk"], divider=True)
+        draw_market_group(draw, row_x, market_top + 258, row_width, "美股", markets["us"], divider=False)
+
+    # The joke has its own quiet card, preserving a little breathing room.
+    joke_top = 944
+    draw_card(draw, (MARGIN, joke_top, WIDTH - MARGIN, joke_top + 160), fill=CARD_LIGHT)
+    draw_eyebrow(draw, MARGIN + 28, joke_top + 20, "TODAY'S LITTLE NOTE")
+    y = joke_top + 58
     joke = JOKES[now.date().toordinal() % len(JOKES)]
-    for line in wrap(draw, joke, body, WIDTH - 144)[:2]:
-        draw.text((72, y), line, font=body, fill=45)
-        y += 49
+    for line in wrap(draw, joke, body, WIDTH - MARGIN * 2 - 56)[:2]:
+        draw.text((MARGIN + 28, y), line, font=body, fill=INK)
+        y += 42
 
-    draw.rounded_rectangle((72, 1160, WIDTH - 72, 1370), radius=26, outline=45, width=2)
-    draw_pet(image, draw, 83, 1196, pet)
-    draw.text((310, 1208), f"电子小鸡 · {pet}", font=title, fill=25)
-    draw.text((310, 1280), "猜猜接下来我会干嘛？", font=body, fill=50)
+    # The hand-drawn pet remains tactile and personal, with a clean divider
+    # separating illustration from its current little life update.
+    pet_top = 1162
+    draw_card(draw, (MARGIN, pet_top, WIDTH - MARGIN, 1370), fill=CARD_LIGHT)
+    draw.line((298, pet_top + 22, 298, 1348), fill=DIVIDER, width=2)
+    draw_pet(image, draw, 83, pet_top + 30, pet)
+    draw_eyebrow(draw, 328, pet_top + 25, "A LITTLE CHECK-IN")
+    draw.text((328, pet_top + 67), f"电子小鸡 · {pet}", font=font(40, True), fill=INK)
+    draw.text((328, pet_top + 137), "猜猜接下来我会干嘛？", font=body, fill=SECONDARY)
 
     OUT.parent.mkdir(parents=True, exist_ok=True)
     image.save(OUT, "PNG", optimize=True)
