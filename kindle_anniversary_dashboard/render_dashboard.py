@@ -663,7 +663,7 @@ def render() -> Path:
     market_top, market_bottom = 548, 976
     draw_card(draw, (MARGIN, market_top, WIDTH - MARGIN, market_bottom))
     draw.text((MARGIN + 28, market_top + 20), "市场速览", font=font(39, True), fill=INK)
-    hint = "\u884c\u60c5\u53ef\u80fd\u5ef6\u8fdf \u00b7 \u6700\u8fd1\u4ea4\u6613\u65e5"
+    hint = "行情可能延迟o抱一丝"
     hint_font = font(23)
     hint_width = draw.textlength(hint, font=hint_font)
     draw.text((WIDTH - MARGIN - 28 - hint_width, market_top + 33), hint, font=hint_font, fill=SECONDARY)
