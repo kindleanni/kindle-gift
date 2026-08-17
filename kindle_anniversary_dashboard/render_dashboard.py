@@ -693,6 +693,10 @@ def render() -> Path:
     fact_top, fact_height = 1008, 180
     draw_card(draw, (MARGIN, fact_top, WIDTH - MARGIN, fact_top + fact_height), fill=CARD_LIGHT)
     draw_eyebrow(draw, MARGIN + 28, fact_top + 20, "TODAY'S FACT")
+    fact_hint = "臭宝今天也要加油学习哦"
+    fact_hint_font = font(22)
+    fact_hint_width = draw.textlength(fact_hint, font=fact_hint_font)
+    draw.text((WIDTH - MARGIN - 28 - fact_hint_width, fact_top + 26), fact_hint, font=fact_hint_font, fill=SECONDARY)
     fact = FACTS[now.date().toordinal() % len(FACTS)]
     fact_font, fact_lines = fit_fact_lines(draw, fact, WIDTH - MARGIN * 2 - 56)
     y = fact_top + 58
