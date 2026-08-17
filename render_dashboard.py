@@ -24,6 +24,15 @@ from zoneinfo import ZoneInfo
 
 from PIL import Image, ImageDraw, ImageFont
 
+try:
+    # Kept in its own file so the large, hand-curated knowledge list stays
+    # easy to extend without obscuring the renderer.
+    from daily_facts import FACTS
+except (ImportError, SyntaxError):
+    # A partial checkout should still render a graceful screen instead of
+    # failing the hourly job outright.
+    FACTS = ["今天的小知识暂时没有加载成功，下一次更新会自动再试。"]
+
 WIDTH, HEIGHT = 1072, 1448
 ROOT = Path(__file__).resolve().parent
 OUT = ROOT / "out" / "anniversary-dashboard.png"
@@ -40,13 +49,6 @@ PET_ART_FILES = {
     "学习中": "studying.png", "运动中": "exercising.png", "打游戏中": "gaming.png", "睡觉中": "sleeping.png",
     "做饭中": "cooking.png", "逛街中": "shopping.png", "洗澡中": "bathing.png", "游泳中": "swimming.png",
 }
-JOKES = [
-    "今天的快乐很简单：见到你，或者想起你。",
-    "我问时间为什么过得这么快，它说：因为你在身边。",
-    "今日宜：牵手、拥抱、一起吃点好吃的。",
-    "小鸡报告：恋爱电量已充满，请继续贴贴。",
-    "世界那么大，最想去的地方还是你身边。",
-]
 FONT_CANDIDATES = [
     "C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/Deng.ttf",
     "C:/Windows/Fonts/simhei.ttf", "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
@@ -315,6 +317,21 @@ def wrap(draw: ImageDraw.ImageDraw, value: str, fnt, max_width: int) -> list[str
     if line:
         lines.append(line)
     return lines
+
+
+def fit_fact_lines(draw: ImageDraw.ImageDraw, value: str, max_width: int) -> tuple[ImageFont.FreeTypeFont, list[str]]:
+    """Fit the full daily fact in the card, preferring comfortable type size."""
+    sizes = (32, 30, 28, 26)
+    # A slightly smaller two-line fact looks calmer than a larger three-line
+    # one with a dangling final punctuation mark.
+    for max_lines in (2, 3):
+        for size in sizes:
+            fact_font = font(size)
+            lines = wrap(draw, value, fact_font, max_width)
+            if len(lines) <= max_lines:
+                return fact_font, lines
+    # The curated list is currently much shorter than this fallback allows.
+    return font(26), wrap(draw, value, font(26), max_width)[:3]
 
 
 def draw_card(draw: ImageDraw.ImageDraw, box: tuple[int, int, int, int], *, fill: int = CARD) -> None:
@@ -646,7 +663,7 @@ def render() -> Path:
     market_top, market_bottom = 548, 976
     draw_card(draw, (MARGIN, market_top, WIDTH - MARGIN, market_bottom))
     draw.text((MARGIN + 28, market_top + 20), "市场速览", font=font(39, True), fill=INK)
-    hint = "行情可能延迟 · 最近交易日"
+    hint = "\u884c\u60c5\u53ef\u80fd\u5ef6\u8fdf \u00b7 \u6700\u8fd1\u4ea4\u6613\u65e5"
     hint_font = font(23)
     hint_width = draw.textlength(hint, font=hint_font)
     draw.text((WIDTH - MARGIN - 28 - hint_width, market_top + 33), hint, font=hint_font, fill=SECONDARY)
@@ -671,21 +688,23 @@ def render() -> Path:
         draw_market_group(draw, row_x, market_top + 232, row_width, "美股", "us", markets["us"], divider=True)
         draw_market_group(draw, row_x, market_top + 310, row_width, "期货", "futures", markets["futures"], divider=False)
 
-    # The joke has its own quiet card, preserving a little breathing room.
-    joke_top = 1008
-    draw_card(draw, (MARGIN, joke_top, WIDTH - MARGIN, joke_top + 150), fill=CARD_LIGHT)
-    draw_eyebrow(draw, MARGIN + 28, joke_top + 20, "TODAY'S LITTLE NOTE")
-    y = joke_top + 58
-    joke = JOKES[now.date().toordinal() % len(JOKES)]
-    for line in wrap(draw, joke, body, WIDTH - MARGIN * 2 - 56)[:2]:
-        draw.text((MARGIN + 28, y), line, font=body, fill=INK)
-        y += 42
+    # The daily fact gets enough vertical room to keep the curated sentence
+    # intact rather than silently cutting it after two large lines.
+    fact_top, fact_height = 1008, 180
+    draw_card(draw, (MARGIN, fact_top, WIDTH - MARGIN, fact_top + fact_height), fill=CARD_LIGHT)
+    draw_eyebrow(draw, MARGIN + 28, fact_top + 20, "TODAY'S FACT")
+    fact = FACTS[now.date().toordinal() % len(FACTS)]
+    fact_font, fact_lines = fit_fact_lines(draw, fact, WIDTH - MARGIN * 2 - 56)
+    y = fact_top + 58
+    for line in fact_lines:
+        draw.text((MARGIN + 28, y), line, font=fact_font, fill=INK)
+        y += 36
 
     # The hand-drawn pet remains tactile and personal, with a clean divider
     # separating illustration from its current little life update.
-    pet_top = 1190
-    draw_card(draw, (MARGIN, pet_top, WIDTH - MARGIN, 1398), fill=CARD_LIGHT)
-    draw.line((298, pet_top + 22, 298, 1376), fill=DIVIDER, width=2)
+    pet_top = 1218
+    draw_card(draw, (MARGIN, pet_top, WIDTH - MARGIN, 1426), fill=CARD_LIGHT)
+    draw.line((298, pet_top + 22, 298, 1404), fill=DIVIDER, width=2)
     draw_pet(image, draw, 83, pet_top + 30, pet)
     draw_eyebrow(draw, 328, pet_top + 25, "A LITTLE CHECK-IN")
     draw.text((328, pet_top + 67), f"电子小鸡 · {pet}", font=font(40, True), fill=INK)
